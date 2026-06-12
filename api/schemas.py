@@ -168,3 +168,12 @@ class BookingPriceCalculateResponse(BaseModel):
     estimated_price: int
     currency: str = "KZT"
     disclaimer: str = "Это примерная стоимость. Итоговая цена зависит от деталей маршрута и условий поездки."
+
+
+class BookingStatusUpdate(BaseModel):
+    status: str = Field(..., pattern=r"^(new|accepted|freelancer|cancelled|completed)$")
+
+
+class BookingRequestDetail(BookingRequestOut):
+    service_name: Optional[str] = None
+    vehicle_class_name: Optional[str] = None

@@ -11,7 +11,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 try:
     from api import models, schemas
@@ -89,6 +89,7 @@ def send_booking_notification(
     contact: str,
     comment: str | None,
     estimated_price: int | None = None,
+    booking_id: int | None = None,
 ) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_ADMINS:
         print("Telegram booking notification skipped: TELEGRAM_BOT_TOKEN or TELEGRAM_ADMINS not configured")
@@ -99,30 +100,39 @@ def send_booking_notification(
     else:
         service_date_text = str(service_date)
 
-    price_text = f"{estimated_price} тг" if estimated_price is not None else "не рассчитана"
+    price_text = f"{estimated_price:,} тг".replace(",", " ") if estimated_price is not None else "не рассчитана"
+    id_text = f" #{booking_id}" if booking_id is not None else ""
 
     text = (
-        "📩 Новая заявка с сайта\n\n"
-        f"🛎 Услуга: {service_name}\n"
-        f"🚘 Класс авто: {vehicle_class_name}\n"
-        f"📅 Дата: {service_date_text}\n"
-        f"💰 Примерная стоимость: {price_text}\n"
-        f"📞 Контакт: {contact}\n"
-        f"💬 Комментарий: {comment or '—'}"
+        f"🆕 Новая заявка{id_text}\n\n"
+        f"🛎 {service_name}\n"
+        f"🚘 {vehicle_class_name}\n"
+        f"📅 {service_date_text}\n"
+        f"💲 Примерная: {price_text}\n"
+        f"📞 {contact}\n"
+        f"💬 {comment or '—'}"
     )
+
+    reply_markup = None
+    if booking_id is not None:
+        reply_markup = {
+            "inline_keyboard": [
+                [
+                    {"text": "🧑 Мы Берём", "callback_data": f"take_booking:{booking_id}"},
+                    {"text": "🚗 Наёмник", "callback_data": f"freelancer_booking:{booking_id}"},
+                ],
+                [{"text": "📋 Открыть заявку", "callback_data": f"open_booking:{booking_id}"}],
+            ]
+        }
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
     for admin_id in TELEGRAM_ADMINS:
         try:
-            response = requests.post(
-                url,
-                json={
-                    "chat_id": admin_id,
-                    "text": text,
-                },
-                timeout=10,
-            )
+            payload: dict = {"chat_id": admin_id, "text": text}
+            if reply_markup:
+                payload["reply_markup"] = reply_markup
+            response = requests.post(url, json=payload, timeout=10)
             print(f"Telegram send to {admin_id}: {response.status_code} {response.text}")
         except Exception as e:
             print(f"Failed to send Telegram booking notification to {admin_id}: {e}")
@@ -357,6 +367,7 @@ def create_booking_request(payload: schemas.BookingRequestCreate, db: Session = 
             contact=booking.contact,
             comment=booking.comment,
             estimated_price=booking.estimated_price,
+            booking_id=booking.id,
         )
     except Exception as e:
         print(f"Booking saved, but Telegram notification failed: {e}")
@@ -695,6 +706,71 @@ def delete_service_review(
     db.delete(review)
     db.commit()
     return None
+
+
+# --------------------
+# Booking requests (admin)
+# --------------------
+@app.get("/api/admin/booking-requests", response_model=List[schemas.BookingRequestDetail])
+def admin_list_booking_requests(
+    status: Optional[str] = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=100),
+    _admin: str = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    q = db.query(models.BookingRequest).options(
+        joinedload(models.BookingRequest.service),
+        joinedload(models.BookingRequest.vehicle_class),
+    )
+    if status:
+        q = q.filter(models.BookingRequest.status == status)
+    bookings = q.order_by(models.BookingRequest.id.desc()).limit(limit).all()
+    result = []
+    for b in bookings:
+        item = schemas.BookingRequestDetail.model_validate(b)
+        item.service_name = b.service.name if b.service else None
+        item.vehicle_class_name = b.vehicle_class.name if b.vehicle_class else None
+        result.append(item)
+    return result
+
+
+@app.get("/api/admin/booking-requests/{booking_id}", response_model=schemas.BookingRequestDetail)
+def admin_get_booking_request(
+    booking_id: int,
+    _admin: str = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    b = (
+        db.query(models.BookingRequest)
+        .options(
+            joinedload(models.BookingRequest.service),
+            joinedload(models.BookingRequest.vehicle_class),
+        )
+        .filter(models.BookingRequest.id == booking_id)
+        .first()
+    )
+    if not b:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found")
+    item = schemas.BookingRequestDetail.model_validate(b)
+    item.service_name = b.service.name if b.service else None
+    item.vehicle_class_name = b.vehicle_class.name if b.vehicle_class else None
+    return item
+
+
+@app.put("/api/admin/booking-requests/{booking_id}/status", response_model=schemas.BookingRequestOut)
+def update_booking_status(
+    booking_id: int,
+    payload: schemas.BookingStatusUpdate,
+    _admin: str = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    b = db.query(models.BookingRequest).filter(models.BookingRequest.id == booking_id).first()
+    if not b:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found")
+    b.status = payload.status
+    db.commit()
+    db.refresh(b)
+    return b
 
 
 # --------------------

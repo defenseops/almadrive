@@ -7,12 +7,13 @@ load_dotenv()
 import asyncio
 import logging
 import os
-import tempfile
+from datetime import datetime
 from functools import wraps
 from typing import List
 
 import httpx
 from telegram import (
+    BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -30,9 +31,6 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-
-from api.cloudinary_storage import CarPhotoStorage
-
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -56,10 +54,7 @@ for x in (os.getenv("TELEGRAM_ADMINS") or "").split(","):
 
 
 # ====== Bot states ======
-TITLE, DESCRIPTION, PHOTOS, CONFIRM = range(4)
 SERVICE_PRICE_VALUE, CLASS_MULTIPLIER_VALUE = range(10, 12)
-
-storage = CarPhotoStorage()
 
 
 def _is_admin(update: Update) -> bool:
@@ -69,7 +64,7 @@ def _is_admin(update: Update) -> bool:
 
 def admin_only(handler):
     @wraps(handler)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, **kwargs):
         if not _is_admin(update):
             if update.effective_message:
                 await update.effective_message.reply_text("⛔ Доступ запрещён (только админ).")
@@ -79,7 +74,7 @@ def admin_only(handler):
                 except Exception:
                     pass
             return ConversationHandler.END if isinstance(update.callback_query, object) else None
-        return await handler(update, context)
+        return await handler(update, context, **kwargs)
 
     return wrapper
 
@@ -109,12 +104,22 @@ async def api_request(method: str, path: str, *, json: dict | None = None, param
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton("🚗 Автомобили"), KeyboardButton("💰 Тарифы")],
+            [KeyboardButton("💰 Тарифы"), KeyboardButton("📨 Заявки")],
             [KeyboardButton("📝 Отзывы о сервисе"), KeyboardButton("📋 Все отзывы сайта")],
-            [KeyboardButton("➕ Добавить авто"), KeyboardButton("❌ Отмена")],
+            [KeyboardButton("❌ Отмена")],
         ],
         resize_keyboard=True,
     )
+
+
+def _booking_action_keyboard(booking_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🧑 Мы Берём", callback_data=f"take_booking:{booking_id}"),
+            InlineKeyboardButton("🚗 Наёмник", callback_data=f"freelancer_booking:{booking_id}"),
+        ],
+        [InlineKeyboardButton("📋 Открыть заявку", callback_data=f"open_booking:{booking_id}")],
+    ])
 
 
 async def safe_send(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, *, reply_markup=None):
@@ -145,16 +150,6 @@ async def safe_edit_or_send(query, context: ContextTypes.DEFAULT_TYPE, text: str
         logger.warning("edit_message_text failed (%s). Fallback to send_message.", type(e).__name__)
         chat_id = query.message.chat_id if query.message else query.from_user.id
         await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
-
-
-def cars_list_keyboard(cars: list[dict]) -> InlineKeyboardMarkup:
-    rows = []
-    for c in cars[:20]:
-        cid = c.get("id")
-        title = c.get("title", "Авто")
-        rows.append([InlineKeyboardButton(f"🗑️ Удалить #{cid} — {title[:40]}", callback_data=f"car_del:{cid}")])
-    rows.append([InlineKeyboardButton("🔄 Обновить список", callback_data="menu_cars")])
-    return InlineKeyboardMarkup(rows)
 
 
 def tariffs_menu_keyboard() -> InlineKeyboardMarkup:
@@ -220,246 +215,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🚗 AlmaDrive Bot\n\nВыберите действие:",
         reply_markup=main_menu_keyboard(),
     )
-
-
-@admin_only
-async def menu_cars(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cars = await api_request("GET", "/api/cars", params={"active_only": "false"})
-    if not cars:
-        await safe_reply(update, context, "Пока нет автомобилей.", reply_markup=main_menu_keyboard())
-        return
-
-    lines = ["🚗 Автомобили:\n"]
-    for c in cars[:20]:
-        title = c.get("title", "Авто")
-        is_active = "✅" if c.get("is_active") else "⛔"
-        lines.append(f"{is_active} #{c.get('id')} — {title}")
-
-    await safe_reply(
-        update,
-        context,
-        "\n".join(lines),
-        reply_markup=cars_list_keyboard(cars),
-    )
-
-
-async def menu_cars_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not query:
-        return
-
-    try:
-        await query.answer()
-    except Exception:
-        pass
-
-    if not _is_admin(update):
-        try:
-            await query.answer("⛔ Только админ", show_alert=True)
-        except Exception:
-            pass
-        return
-
-    try:
-        cars = await api_request("GET", "/api/cars", params={"active_only": "false"})
-        if not cars:
-            await safe_edit_or_send(query, context, "Пока нет автомобилей.")
-            return
-
-        lines = ["🚗 Автомобили:\n"]
-        for c in cars[:20]:
-            title = c.get("title", "Авто")
-            is_active = "✅" if c.get("is_active") else "⛔"
-            lines.append(f"{is_active} #{c.get('id')} — {title}")
-
-        await safe_edit_or_send(
-            query,
-            context,
-            "\n".join(lines),
-            reply_markup=cars_list_keyboard(cars),
-        )
-    except Exception as e:
-        logger.exception("menu_cars_callback failed")
-        await safe_edit_or_send(query, context, f"❌ Ошибка загрузки авто: {e}")
-
-
-@admin_only
-async def list_cars(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await menu_cars(update, context)
-
-
-@admin_only
-async def add_car(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await safe_reply(update, context, "Введите название авто (title):")
-    return TITLE
-
-
-async def process_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["title"] = (update.message.text or "").strip()
-    await safe_reply(update, context, "Введите описание (или отправьте '-' чтобы пропустить):")
-    return DESCRIPTION
-
-
-async def process_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
-    context.user_data["description"] = None if text == "-" else text
-    context.user_data["photos"] = []
-    await safe_reply(
-        update,
-        context,
-        "Отправьте фото автомобиля (можно несколько). Когда закончите — /done. /skip — без фото."
-    )
-    return PHOTOS
-
-
-async def process_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    photos = update.message.photo
-    if not photos:
-        return PHOTOS
-
-    photo = photos[-1]
-    file = await photo.get_file()
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
-        await file.download_to_drive(custom_path=tmp.name)
-        context.user_data["photos"].append(tmp.name)
-
-    await safe_reply(
-        update,
-        context,
-        f"Фото добавлено ✅ (всего: {len(context.user_data['photos'])}). Ещё? /done когда закончите."
-    )
-    return PHOTOS
-
-
-async def process_done_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    title = context.user_data.get("title") or "Автомобиль"
-    desc = context.user_data.get("description") or ""
-    count = len(context.user_data.get("photos") or [])
-    keyboard = InlineKeyboardMarkup(
-        [[
-            InlineKeyboardButton("✅ Создать", callback_data="confirm_create"),
-            InlineKeyboardButton("❌ Отмена", callback_data="confirm_cancel"),
-        ]]
-    )
-    await safe_reply(
-        update,
-        context,
-        f"Проверьте данные:\n\n"
-        f"Название: {title}\n"
-        f"Описание: {desc[:400]}\n"
-        f"Фото: {count}\n\n"
-        f"Создать авто?",
-        reply_markup=keyboard,
-    )
-    return CONFIRM
-
-
-async def process_skip_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await process_done_photos(update, context)
-
-
-async def process_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-
-    try:
-        await query.answer("⏳ Выполняю...", show_alert=False)
-    except Exception:
-        pass
-
-    if query.data == "confirm_cancel":
-        await safe_edit_or_send(query, context, "Отменено.")
-        _cleanup_photos(context)
-        context.user_data.clear()
-        return ConversationHandler.END
-
-    await safe_edit_or_send(query, context, "⏳ Создаю авто и загружаю фото...")
-
-    title = context.user_data.get("title") or "Автомобиль"
-    payload = {
-        "title": title,
-        "description": context.user_data.get("description"),
-        "images": [],
-        "thumbnail": None,
-        "is_active": True,
-    }
-    car = await api_request("POST", "/api/cars", json=payload)
-    car_id = car["id"]
-
-    photo_paths: List[str] = context.user_data.get("photos") or []
-    urls: List[str] = []
-
-    for i, path in enumerate(photo_paths):
-        try:
-            url = await asyncio.to_thread(storage.save_photo, path, car_id, i)
-            urls.append(url)
-        except Exception as e:
-            logger.exception("Photo upload failed: %s", e)
-
-    thumbnail = urls[0] if urls else None
-
-    if urls or thumbnail:
-        await api_request("PUT", f"/api/cars/{car_id}", json={"images": urls, "thumbnail": thumbnail})
-
-    await safe_edit_or_send(query, context, f"✅ Авто создано: #{car_id} — {title}")
-
-    _cleanup_photos(context)
-    context.user_data.clear()
-    return ConversationHandler.END
-
-
-def _cleanup_photos(context: ContextTypes.DEFAULT_TYPE):
-    for p in (context.user_data.get("photos") or []):
-        try:
-            os.remove(p)
-        except Exception:
-            pass
-
-
-@admin_only
-async def delete_car(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await safe_reply(update, context, "Использование: /delete_car <id>")
-        return
-    try:
-        car_id = int(context.args[0])
-    except ValueError:
-        await safe_reply(update, context, "ID должен быть числом.")
-        return
-
-    await api_request("DELETE", f"/api/cars/{car_id}")
-    await safe_reply(update, context, f"🗑️ Удалено авто #{car_id}", reply_markup=main_menu_keyboard())
-
-
-async def car_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not query:
-        return
-
-    try:
-        await query.answer("⏳", show_alert=False)
-    except Exception:
-        pass
-
-    if not _is_admin(update):
-        try:
-            await query.answer("⛔ Только админ", show_alert=True)
-        except Exception:
-            pass
-        return
-
-    data = query.data or ""
-    try:
-        _, car_id_s = data.split(":", 1)
-        car_id = int(car_id_s)
-    except Exception:
-        return
-
-    try:
-        await api_request("DELETE", f"/api/cars/{car_id}")
-        await safe_edit_or_send(query, context, f"🗑️ Авто #{car_id} удалено")
-    except Exception as e:
-        await safe_edit_or_send(query, context, f"❌ Ошибка удаления: {e}")
 
 
 @admin_only
@@ -982,19 +737,132 @@ async def published_reviews_page_callback(update: Update, context: ContextTypes.
     await published_reviews_list(fake, context, page=page)
 
 
+@admin_only
+async def menu_bookings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        bookings = await api_request("GET", "/api/admin/booking-requests", params={"status": "new", "limit": "20"})
+    except Exception as e:
+        await safe_reply(update, context, f"❌ Ошибка загрузки заявок: {e}")
+        return
+
+    if not bookings:
+        await safe_reply(update, context, "✅ Нет новых заявок.", reply_markup=main_menu_keyboard())
+        return
+
+    await safe_reply(update, context, f"📨 Новые заявки: {len(bookings)}", reply_markup=main_menu_keyboard())
+
+    for b in bookings:
+        bid = b.get("id")
+        service_name = b.get("service_name") or "?"
+        vehicle_class_name = b.get("vehicle_class_name") or "?"
+        service_date = b.get("service_date") or "?"
+        try:
+            service_date = datetime.fromisoformat(service_date).strftime("%d.%m.%Y %H:%M")
+        except Exception:
+            pass
+        contact = b.get("contact") or "?"
+        comment = (b.get("comment") or "—")[:300]
+        price = b.get("estimated_price")
+        price_text = f"{price:,} тг".replace(",", " ") if price else "не рассчитана"
+
+        msg = (
+            f"🆕 Заявка #{bid}\n"
+            f"🛎 {service_name}\n"
+            f"🚘 {vehicle_class_name}\n"
+            f"📅 {service_date}\n"
+            f"💲 Примерная: {price_text}\n"
+            f"📞 {contact}\n"
+            f"💬 {comment}"
+        )
+        await safe_reply(update, context, msg, reply_markup=_booking_action_keyboard(int(bid)))
+
+
+async def booking_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+
+    try:
+        await query.answer("⏳", show_alert=False)
+    except Exception:
+        pass
+
+    if not _is_admin(update):
+        try:
+            await query.answer("⛔ Только админ", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    data = query.data or ""
+    try:
+        action, bid_s = data.split(":", 1)
+        bid = int(bid_s)
+    except Exception:
+        return
+
+    if action == "take_booking":
+        try:
+            await api_request("PUT", f"/api/admin/booking-requests/{bid}/status", json={"status": "accepted"})
+            await safe_edit_or_send(query, context, f"✅ Заявка #{bid} принята — везём сами")
+        except Exception as e:
+            await safe_edit_or_send(query, context, f"❌ Ошибка: {e}")
+
+    elif action == "freelancer_booking":
+        try:
+            await api_request("PUT", f"/api/admin/booking-requests/{bid}/status", json={"status": "freelancer"})
+            await safe_edit_or_send(query, context, f"🚗 Заявка #{bid} передана наёмнику")
+        except Exception as e:
+            await safe_edit_or_send(query, context, f"❌ Ошибка: {e}")
+
+    elif action == "open_booking":
+        try:
+            b = await api_request("GET", f"/api/admin/booking-requests/{bid}")
+            service_name = b.get("service_name") or "?"
+            vehicle_class_name = b.get("vehicle_class_name") or "?"
+            service_date = b.get("service_date") or "?"
+            try:
+                service_date = datetime.fromisoformat(service_date).strftime("%d.%m.%Y %H:%M")
+            except Exception:
+                pass
+            contact = b.get("contact") or "?"
+            comment = (b.get("comment") or "—")
+            price = b.get("estimated_price")
+            price_text = f"{price:,} тг".replace(",", " ") if price else "не рассчитана"
+            bstatus_map = {
+                "new": "🆕 Новая",
+                "accepted": "✅ Принята",
+                "freelancer": "🚗 Наёмник",
+                "cancelled": "❌ Отменена",
+                "completed": "✔️ Завершена",
+            }
+            bstatus = bstatus_map.get(b.get("status", ""), b.get("status", "?"))
+
+            msg = (
+                f"📋 Заявка #{bid} — {bstatus}\n\n"
+                f"🛎 {service_name}\n"
+                f"🚘 {vehicle_class_name}\n"
+                f"📅 {service_date}\n"
+                f"💲 Примерная: {price_text}\n"
+                f"📞 {contact}\n"
+                f"💬 {comment}"
+            )
+            await safe_edit_or_send(query, context, msg, reply_markup=_booking_action_keyboard(bid))
+        except Exception as e:
+            await safe_edit_or_send(query, context, f"❌ Ошибка загрузки заявки: {e}")
+
+
 async def menu_buttons_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.effective_message.text or "").strip()
 
-    if text == "🚗 Автомобили":
-        return await menu_cars(update, context)
     if text == "💰 Тарифы":
         return await tariffs_menu(update, context)
     if text == "📝 Отзывы о сервисе":
         return await service_reviews_pending(update, context)
     if text == "📋 Все отзывы сайта":
         return await published_reviews_list(update, context, page=0)
-    if text == "➕ Добавить авто":
-        return await add_car(update, context)
+    if text == "📨 Заявки":
+        return await menu_bookings(update, context)
     if text == "❌ Отмена":
         return await cancel(update, context)
 
@@ -1002,7 +870,6 @@ async def menu_buttons_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    _cleanup_photos(context)
     context.user_data.clear()
     await safe_reply(update, context, "Отменено.", reply_markup=main_menu_keyboard())
     return ConversationHandler.END
@@ -1041,43 +908,10 @@ def main():
     app.add_error_handler(on_error)
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("list_cars", list_cars))
-    app.add_handler(CommandHandler("delete_car", delete_car))
     app.add_handler(CommandHandler("service_reviews_pending", service_reviews_pending))
     app.add_handler(CommandHandler("tariffs", tariffs_show))
 
-    app.add_handler(MessageHandler(
-        filters.Regex(r"^(🚗 Автомобили|💰 Тарифы|📝 Отзывы о сервисе|📋 Все отзывы сайта|➕ Добавить авто|❌ Отмена)$"),
-        menu_buttons_handler
-    ))
-
-    app.add_handler(CallbackQueryHandler(published_reviews_page_callback, pattern=r"^pub_rev_page:\d+$"))
-    app.add_handler(CallbackQueryHandler(published_reviews_page_callback, pattern=r"^pub_rev_menu$"))
-    app.add_handler(CallbackQueryHandler(service_review_action_callback, pattern=r"^srv_(appr|hide|del):"))
-    app.add_handler(CallbackQueryHandler(car_delete_callback, pattern=r"^car_del:"))
-    app.add_handler(CallbackQueryHandler(tariffs_show_callback, pattern=r"^tariffs_show$"))
-    app.add_handler(CallbackQueryHandler(tariffs_service_pick_callback, pattern=r"^tariffs_service_pick$"))
-    app.add_handler(CallbackQueryHandler(tariffs_class_pick_callback, pattern=r"^tariffs_class_pick$"))
-    app.add_handler(CallbackQueryHandler(tariffs_show_callback, pattern=r"^menu_tariffs$"))
-    app.add_handler(CallbackQueryHandler(menu_cars_callback, pattern=r"^menu_cars$"))
-
-    conv = ConversationHandler(
-        entry_points=[CommandHandler("add_car", add_car)],
-        states={
-            TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_title)],
-            DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_description)],
-            PHOTOS: [
-                MessageHandler(filters.PHOTO, process_photo),
-                CommandHandler("done", process_done_photos),
-                CommandHandler("skip", process_skip_photos),
-            ],
-            CONFIRM: [CallbackQueryHandler(process_confirmation, pattern=r"^confirm_(create|cancel)$")],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        per_chat=True,
-        per_user=True,
-    )
-
+    # ConversationHandler для редактирования тарифов (price_conv регистрируем до кнопочного меню)
     price_conv = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(select_service_price_callback, pattern=r"^set_srv_price:\d+$"),
@@ -1092,8 +926,23 @@ def main():
         per_user=True,
     )
 
-    app.add_handler(conv)
     app.add_handler(price_conv)
+
+    # Кнопочное меню
+    app.add_handler(MessageHandler(
+        filters.Regex(r"^(💰 Тарифы|📝 Отзывы о сервисе|📋 Все отзывы сайта|📨 Заявки|❌ Отмена)$"),
+        menu_buttons_handler
+    ))
+
+    # Inline callback-и
+    app.add_handler(CallbackQueryHandler(booking_action_callback, pattern=r"^(take_booking|freelancer_booking|open_booking):\d+$"))
+    app.add_handler(CallbackQueryHandler(published_reviews_page_callback, pattern=r"^pub_rev_page:\d+$"))
+    app.add_handler(CallbackQueryHandler(published_reviews_page_callback, pattern=r"^pub_rev_menu$"))
+    app.add_handler(CallbackQueryHandler(service_review_action_callback, pattern=r"^srv_(appr|hide|del):"))
+    app.add_handler(CallbackQueryHandler(tariffs_show_callback, pattern=r"^tariffs_show$"))
+    app.add_handler(CallbackQueryHandler(tariffs_service_pick_callback, pattern=r"^tariffs_service_pick$"))
+    app.add_handler(CallbackQueryHandler(tariffs_class_pick_callback, pattern=r"^tariffs_class_pick$"))
+    app.add_handler(CallbackQueryHandler(tariffs_show_callback, pattern=r"^menu_tariffs$"))
     app.add_handler(MessageHandler(filters.COMMAND, unknown))
 
     logger.info("🤖 Bot started")
